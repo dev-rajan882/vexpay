@@ -1,0 +1,16 @@
+{
+  "name": "vex-pay-vercel-backend",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^5.3.0",
+    "firebase-admin": "^13.6.0",
+    "googleapis": "^189.0.0"
+  }
+}
