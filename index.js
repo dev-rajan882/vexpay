@@ -1,11 +1,11 @@
-﻿import "dotenv/config";
+import "dotenv/config";
 import { initializeApp, cert, getApps } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 import { google } from "googleapis";
 import crypto from "node:crypto";
 import express from "express";
 
-// --- Lazy Singleton Database Connection (Prevents Deployment 10s Timeout) ---
+// --- Lazy Singleton Database Connection ---
 let _db = null;
 function getDb() {
   if (!_db) {
@@ -27,12 +27,15 @@ const MERCHANT_UPI_ID = process.env.MERCHANT_UPI_ID || "paytmqr6rwd4k@ptys";
 const MERCHANT_NAME = process.env.MERCHANT_NAME || "rinku sinha";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "https://gen-lang-client-0389921130.web.app/oauth2callback";
-const FRONTEND_URL = process.env.FRONTEND_URL || "/";
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "https://vexpay-seven.vercel.app/oauth2callback";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://vexpay.netlify.app/";
 
-const ORDER_EXPIRY_MS = 10 * 60 * 1000;
+const ORDER_EXPIRY_MS = 5 * 60 * 1000;
 const SLOT_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_SLOTS = 30;
+
+let lastSyncMs = 0;
+let syncInProgress = null;
 
 const id = (p) => `${p}_${crypto.randomBytes(9).toString("hex").toUpperCase()}`;
 const hash = (s) => crypto.createHash("sha256").update(s || "").digest("hex");
@@ -47,6 +50,19 @@ function getOAuthClient() {
   );
 }
 
+async function triggerAutoSync(minIntervalMs = 4000) {
+  const t = now();
+  if (syncInProgress) return syncInProgress;
+  if (t - lastSyncMs < minIntervalMs) return null;
+  lastSyncMs = t;
+  syncInProgress = runGmailSync()
+    .catch((err) => console.error("Auto sync error:", err.message))
+    .finally(() => {
+      syncInProgress = null;
+    });
+  return syncInProgress;
+}
+
 // Dynamic Slot Allocation
 async function allocateSlot(basePaise) {
   const db = getDb();
@@ -56,7 +72,7 @@ async function allocateSlot(basePaise) {
     .where("status", "in", ["PENDING", "SUCCESS", "EXPIRED"])
     .get();
 
-  const recentOrders = snap.docs.map(d => d.data());
+  const recentOrders = snap.docs.map((d) => d.data());
 
   for (let slot = 1; slot <= MAX_SLOTS; slot++) {
     const candidatePaise = basePaise + slot;
@@ -64,14 +80,16 @@ async function allocateSlot(basePaise) {
 
     for (const order of recentOrders) {
       if (order.payablePaise !== candidatePaise) continue;
-      
+
       if (order.status === "PENDING" && t < order.expiresAtMs) {
         isOccupied = true;
         break;
       }
 
-      const releaseTime = order.expiredAtMs || (order.verifiedAt ? new Date(order.verifiedAt).getTime() : order.expiresAtMs);
-      if (releaseTime && (t - releaseTime < SLOT_COOLDOWN_MS)) {
+      const releaseTime =
+        order.expiredAtMs ||
+        (order.verifiedAt ? new Date(order.verifiedAt).getTime() : order.expiresAtMs);
+      if (releaseTime && t - releaseTime < SLOT_COOLDOWN_MS) {
         isOccupied = true;
         break;
       }
@@ -87,22 +105,31 @@ function decodeBase64Url(data) {
   return Buffer.from(base64, "base64").toString("utf-8");
 }
 
+function cleanHtml(s = "") {
+  return s
+    .replace(/<\s*br\s*\/?>/gi, "\n")
+    .replace(/<\/\s*(div|p|tr|td|li|h[1-6])\s*>/gi, "\n")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;|\u00a0/gi, " ")
+    .replace(/&#8377;|&#x20b9;|&inr;/gi, "₹")
+    .replace(/&amp;/gi, "&")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
+
 function extractAllText(payload) {
+  if (!payload) return "";
   let text = "";
   if (payload.body && payload.body.data) {
-    text += decodeBase64Url(payload.body.data) + " ";
+    const raw = decodeBase64Url(payload.body.data);
+    text += (payload.mimeType === "text/html" ? cleanHtml(raw) : raw) + "\n";
   }
   if (payload.parts) {
     for (const part of payload.parts) {
-      if (part.body && part.body.data) {
-        text += decodeBase64Url(part.body.data) + " ";
-      }
-      if (part.parts) {
-        text += extractAllText(part) + " ";
-      }
+      text += extractAllText(part) + "\n";
     }
   }
-  return text;
+  return cleanHtml(text);
 }
 
 const app = express();
@@ -158,7 +185,7 @@ app.get(["/oauth2callback", "/api/oauth2callback"], async (req, res) => {
       <html>
       <body style="font-family:sans-serif; background:#0b1020; color:#fff; display:flex; align-items:center; justify-content:center; height:100vh; margin:0;">
         <div style="background:#131b34; padding:40px; border-radius:14px; text-align:center;">
-          <h2 style="color:#28c995;">âœ… Gmail Connected!</h2>
+          <h2 style="color:#28c995;">✅ Gmail Connected!</h2>
           <a href="${FRONTEND_URL}" style="display:inline-block; margin-top:20px; padding:12px 24px; background:#6d8cff; color:#fff; text-decoration:none; border-radius:8px;">Go to Dashboard</a>
         </div>
       </body>
@@ -172,7 +199,8 @@ app.get(["/oauth2callback", "/api/oauth2callback"], async (req, res) => {
 // ---------------- Fast Dashboard API ----------------
 app.get(["/api/dashboard", "/dashboard"], async (req, res) => {
   try {
-    res.set("Cache-Control", "public, max-age=3, s-maxage=5");
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+    await triggerAutoSync(8000);
     const db = getDb();
 
     const [ordersSnap, appsSnap, logsSnap, webhooksSnap, authSnap, oldStoreSnap] = await Promise.all([
@@ -184,11 +212,11 @@ app.get(["/api/dashboard", "/dashboard"], async (req, res) => {
       db.collection("vex_pay_gateway").doc("store_data").get()
     ]);
 
-    const orders = ordersSnap.docs.map(d => ({ ...d.data(), id: d.id }));
-    const apps = appsSnap.docs.map(d => ({ ...d.data(), id: d.id }));
-    const logs = logsSnap.docs.map(d => d.data());
+    const orders = ordersSnap.docs.map((d) => ({ ...d.data(), id: d.id }));
+    const apps = appsSnap.docs.map((d) => ({ ...d.data(), id: d.id }));
+    const logs = logsSnap.docs.map((d) => d.data());
 
-    const events = webhooksSnap.docs.map(d => {
+    const events = webhooksSnap.docs.map((d) => {
       const data = d.data();
       const statusValue = data.deliveryStatus || data.delivery_status || data.status || "DELIVERED";
       const timeValue = data.dispatched_at || data.dispatchedAt || data.createdAt || "-";
@@ -209,7 +237,7 @@ app.get(["/api/dashboard", "/dashboard"], async (req, res) => {
       };
     });
 
-    const isGmailConnected = 
+    const isGmailConnected =
       (authSnap.exists && Boolean(authSnap.data()?.tokens)) ||
       (oldStoreSnap.exists && Boolean(oldStoreSnap.data()?.tokens));
 
@@ -225,10 +253,10 @@ app.get(["/api/dashboard", "/dashboard"], async (req, res) => {
   }
 });
 
-// ---------------- Admin App Registration ----------------
+// ---------------- Admin App Management (Add, Edit, Toggle, Rotate, Delete) ----------------
 app.post(["/api/admin/apps", "/admin/apps"], async (req, res) => {
   try {
-    const { name, webhookUrl } = req.body;
+    const { name, webhookUrl } = req.body || {};
     if (!name) return res.status(400).json({ error: "App name is required" });
 
     const appId = id("APP");
@@ -249,19 +277,114 @@ app.post(["/api/admin/apps", "/admin/apps"], async (req, res) => {
     const db = getDb();
     await db.collection("apps").doc(appId).set(newApp);
 
+    await db.collection("activity_logs").add({
+      type: "info",
+      message: `Application created: ${newApp.name} (${appId})`,
+      at: new Date().toISOString()
+    });
+
     return res.json({ success: true, ...newApp, apiKey });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
 });
 
-// ---------------- Create Order API (STRICT AUTHENTICATION) ----------------
+app.put(["/api/admin/apps/:appId/webhook", "/admin/apps/:appId/webhook"], async (req, res) => {
+  try {
+    const { appId } = req.params;
+    const { webhookUrl } = req.body || {};
+    const db = getDb();
+    await db.collection("apps").doc(appId).set({ webhookUrl: (webhookUrl || "").trim() }, { merge: true });
+    return res.json({ success: true });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.put(["/api/admin/apps/:appId/status", "/admin/apps/:appId/status"], async (req, res) => {
+  try {
+    const { appId } = req.params;
+    const { active } = req.body || {};
+    const db = getDb();
+    await db.collection("apps").doc(appId).set({ active: Boolean(active) }, { merge: true });
+    return res.json({ success: true });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post(["/api/admin/apps/:appId/rotate-credentials", "/admin/apps/:appId/rotate-credentials"], async (req, res) => {
+  try {
+    const { appId } = req.params;
+    const apiKey = `vex_${crypto.randomBytes(24).toString("hex")}`;
+    const webhookSecret = `whsec_${crypto.randomBytes(24).toString("hex")}`;
+    const db = getDb();
+    await db.collection("apps").doc(appId).set({
+      apiKeyHash: hash(apiKey),
+      apiKeyHint: `${apiKey.slice(0, 8)}...${apiKey.slice(-4)}`,
+      webhookSecret
+    }, { merge: true });
+    return res.json({ success: true, apiKey, webhookSecret });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete(["/api/admin/apps/:appId", "/admin/apps/:appId"], async (req, res) => {
+  try {
+    const { appId } = req.params;
+    const db = getDb();
+
+    // 1. Delete direct document by ID
+    await db.collection("apps").doc(appId).delete();
+
+    // 2. Also delete any document where field id == appId (if stored under different doc ID)
+    const matchingSnap = await db.collection("apps").where("id", "==", appId).get();
+    for (const d of matchingSnap.docs) {
+      await d.ref.delete();
+    }
+
+    await db.collection("activity_logs").add({
+      type: "warning",
+      message: `Application deleted: ${appId}`,
+      at: new Date().toISOString()
+    });
+
+    return res.json({ success: true, deletedId: appId });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------- Export Orders CSV ----------------
+app.get(["/api/orders.csv", "/orders.csv"], async (req, res) => {
+  try {
+    const db = getDb();
+    const snap = await db.collection("orders").orderBy("createdAtMs", "desc").limit(500).get();
+    const cols = ["orderId", "appId", "appName", "appOrderId", "payableAmount", "slotIndex", "status", "utr", "createdAt", "verifiedAt"];
+    const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const rows = [
+      cols.join(","),
+      ...snap.docs.map((d) => {
+        const o = d.data();
+        return cols.map((c) => esc(o[c])).join(",");
+      })
+    ].join("\n");
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="vex-pay-orders.csv"');
+    return res.send(rows);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------- Create Order API ----------------
 app.post(["/api/v1/orders", "/v1/orders"], async (req, res) => {
   try {
     const apiKey = req.headers["x-vex-api-key"];
     const db = getDb();
 
-    // 1. Strict API Key Check
     if (!apiKey) {
       return res.status(401).json({
         success: false,
@@ -269,7 +392,6 @@ app.post(["/api/v1/orders", "/v1/orders"], async (req, res) => {
       });
     }
 
-    // 2. Validate API Key against 'apps' collection
     const appSnap = await db.collection("apps")
       .where("apiKeyHash", "==", hash(apiKey))
       .where("active", "==", true)
@@ -285,8 +407,7 @@ app.post(["/api/v1/orders", "/v1/orders"], async (req, res) => {
 
     const appRecord = appSnap.docs[0].data();
 
-    // 3. Amount & Payload Validation
-    const { amount, app_order_id, customer_id, customer_name } = req.body;
+    const { amount, app_order_id, customer_id, customer_name } = req.body || {};
     if (!amount || isNaN(amount) || Number(amount) <= 0) {
       return res.status(400).json({ success: false, error: "Invalid payment amount" });
     }
@@ -312,6 +433,7 @@ app.post(["/api/v1/orders", "/v1/orders"], async (req, res) => {
       webhookSecret: appRecord.webhookSecret,
       appOrderId: String(app_order_id || orderId),
       customerName: cleanUser,
+      originalAmount: money(basePaise),
       payableAmount: payableFormatted,
       payablePaise: allocation.payablePaise,
       slotIndex: allocation.suffix,
@@ -333,20 +455,29 @@ app.post(["/api/v1/orders", "/v1/orders"], async (req, res) => {
   }
 });
 
-// ---------------- Order Status Check ----------------
+// ---------------- Order Status Check (Auto-Syncs Gmail!) ----------------
 app.get(["/api/order-status", "/order-status"], async (req, res) => {
   const { orderId } = req.query;
   const db = getDb();
 
-  let orderSnap = await db.collection("orders").doc(orderId).get();
+  let orderSnap = await db.collection("orders").doc(String(orderId || "")).get();
   let orderData = orderSnap.exists ? orderSnap.data() : null;
 
-  if (!orderData) {
-    const qSnap = await db.collection("orders").where("appOrderId", "==", orderId).limit(1).get();
+  if (!orderData && orderId) {
+    const qSnap = await db.collection("orders").where("appOrderId", "==", String(orderId)).limit(1).get();
     if (!qSnap.empty) orderData = qSnap.docs[0].data();
   }
 
   if (!orderData) return res.status(404).json({ error: "Order not found" });
+
+  // If order is still PENDING, automatically trigger Gmail sync so verification happens live!
+  if (orderData.status === "PENDING") {
+    await triggerAutoSync(4000);
+    const refreshedSnap = await db.collection("orders").doc(orderData.orderId).get();
+    if (refreshedSnap.exists) {
+      orderData = refreshedSnap.data();
+    }
+  }
 
   const isExpired = orderData.status === "PENDING" && now() > orderData.expiresAtMs;
   return res.json({
@@ -368,7 +499,6 @@ app.all(["/api/sync", "/sync"], async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 // ---------------- Payment Verification Engine ----------------
 async function runGmailSync() {
@@ -414,7 +544,7 @@ async function runGmailSync() {
   const listRes = await gmail.users.messages.list({
     userId: "me",
     q: "from:paytm.com OR from:paytm newer_than:1d",
-    maxResults: 15
+    maxResults: 20
   });
 
   const messages = listRes.data.messages || [];
@@ -430,37 +560,53 @@ async function runGmailSync() {
     const emailData = await gmail.users.messages.get({ userId: "me", id: msg.id, format: "full" });
     const emailTimestampMs = Number(emailData.data.internalDate) || Date.now();
 
-    const headers = emailData.data.payload.headers || [];
-    const subject = headers.find((h) => h.name.toLowerCase() === "subject")?.value || "";
+    const headers = emailData.data.payload?.headers || [];
+    const subject = headers.find((h) => h.name?.toLowerCase() === "subject")?.value || "";
     const bodyContent = extractAllText(emailData.data.payload);
-    const snippet = emailData.data.snippet || "";
+    const snippet = cleanHtml(emailData.data.snippet || "");
 
-    const combinedText = `${subject} ${snippet} ${bodyContent}`;
+    const combinedText = `${subject}\n${snippet}\n${bodyContent}`;
 
-    const amountRegex = /(?:Rs\.?|INR|â‚¹)\s*([\d,]+\.\d{2})/gi;
-    const utrRegex = /(?:Order\s*ID[:\s]*|Txn[:\s]*|UTR[:\s]*)([A-Z0-9]{12,30})/i;
+    const amountRegex = /(?:Rs\.?|INR|₹)\s*([\d,]+(?:\.\.\d{1,2}|\.\d{1,2})?)/gi;
+    const utrRegex = /(?:Order\s*ID|Transaction\s*ID|Txn\s*ID|Txn|UTR|UPI\s*Ref(?:\s*No)?|RRN)[:\s#-]*([A-Z0-9]{8,35})/i;
 
     const utrMatch = combinedText.match(utrRegex);
-    const utr = utrMatch ? utrMatch[1] : `TXN_${Date.now()}`;
+    const utr = utrMatch ? utrMatch[1] : `TXN_${msg.id.slice(0, 10).toUpperCase()}`;
 
+    const extractedPaiseSet = new Set();
     let match;
     while ((match = amountRegex.exec(combinedText)) !== null) {
       const amtStr = match[1].replace(/,/g, "");
-      const amtPaise = Math.round(parseFloat(amtStr) * 100);
+      const val = parseFloat(amtStr);
+      if (Number.isFinite(val) && val > 0) {
+        extractedPaiseSet.add(Math.round(val * 100));
+      }
+    }
 
-      // Matching active orders
+    let matchedThisEmail = false;
+
+    for (const amtPaise of extractedPaiseSet) {
       const orderMatches = await db.collection("orders")
         .where("payablePaise", "==", amtPaise)
         .where("status", "in", ["PENDING", "EXPIRED"])
         .get();
 
-      for (const orderDoc of orderMatches.docs) {
-        const targetOrder = orderDoc.data();
+      // Sort newest order first, and PENDING before EXPIRED
+      const sortedDocs = orderMatches.docs.slice().sort((a, b) => {
+        const oa = a.data();
+        const ob = b.data();
+        if (oa.status !== ob.status) return oa.status === "PENDING" ? -1 : 1;
+        return (ob.createdAtMs || 0) - (oa.createdAtMs || 0);
+      });
 
-        // TIME VALIDATION: Email order creation ke baad ka hona chahiye
-        if (emailTimestampMs < (targetOrder.createdAtMs - 30000)) {
-          continue; // Old payment ignored
-        }
+      for (const orderDoc of sortedDocs) {
+        const targetOrder = orderDoc.data();
+        const orderCreatedMs = Number(targetOrder.createdAtMs) || 0;
+        const orderExpiresMs = Number(targetOrder.expiresAtMs) || (orderCreatedMs + ORDER_EXPIRY_MS);
+
+        // Email must arrive after order creation (-60s buffer) and within 20 mins of order creation
+        if (emailTimestampMs < orderCreatedMs - 60000) continue;
+        if (emailTimestampMs > orderExpiresMs + 15 * 60 * 1000) continue;
 
         const verifiedAt = new Date().toISOString();
         const verifiedAtMs = Date.now();
@@ -474,11 +620,10 @@ async function runGmailSync() {
 
         await db.collection("activity_logs").add({
           type: "success",
-          message: `Order ${targetOrder.orderId} verified for â‚¹${targetOrder.payableAmount} (UTR: ${utr})`,
+          message: `Order ${targetOrder.orderId} verified for ₹${targetOrder.payableAmount} (UTR: ${utr})`,
           at: verifiedAt
         });
 
-        // Webhook dispatch
         const webhookEventId = id("EVT");
         let deliveryStatus = "DELIVERED";
 
@@ -519,11 +664,17 @@ async function runGmailSync() {
         });
 
         verifiedCount++;
+        matchedThisEmail = true;
         break;
       }
+
+      if (matchedThisEmail) break;
     }
 
-    seenIds.add(msg.id);
+    // Only mark email as seen if it matched an order OR is older than 15 minutes
+    if (matchedThisEmail || (t - emailTimestampMs > 15 * 60 * 1000)) {
+      seenIds.add(msg.id);
+    }
   }
 
   const trimmed = Array.from(seenIds).slice(-150);
