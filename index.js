@@ -253,7 +253,7 @@ app.get(["/api/dashboard", "/dashboard"], async (req, res) => {
   }
 });
 
-// ---------------- Admin App Management (Add, Edit, Toggle, Rotate, Delete) ----------------
+// ---------------- Admin App Management ----------------
 app.post(["/api/admin/apps", "/admin/apps"], async (req, res) => {
   try {
     const { name, webhookUrl } = req.body || {};
@@ -335,10 +335,8 @@ app.delete(["/api/admin/apps/:appId", "/admin/apps/:appId"], async (req, res) =>
     const { appId } = req.params;
     const db = getDb();
 
-    // 1. Delete direct document by ID
     await db.collection("apps").doc(appId).delete();
 
-    // 2. Also delete any document where field id == appId (if stored under different doc ID)
     const matchingSnap = await db.collection("apps").where("id", "==", appId).get();
     for (const d of matchingSnap.docs) {
       await d.ref.delete();
@@ -470,7 +468,6 @@ app.get(["/api/order-status", "/order-status"], async (req, res) => {
 
   if (!orderData) return res.status(404).json({ error: "Order not found" });
 
-  // If order is still PENDING, automatically trigger Gmail sync so verification happens live!
   if (orderData.status === "PENDING") {
     await triggerAutoSync(4000);
     const refreshedSnap = await db.collection("orders").doc(orderData.orderId).get();
@@ -500,12 +497,12 @@ app.all(["/api/sync", "/sync"], async (req, res) => {
   }
 });
 
-// ---------------- Payment Verification Engine ----------------
+// ---------------- Payment Verification Engine (Strict Expiry Check) ----------------
 async function runGmailSync() {
   const db = getDb();
   const t = now();
 
-  // Expire outdated orders
+  // 1. Expire outdated orders first
   const pendingSnap = await db.collection("orders").where("status", "==", "PENDING").get();
   for (const doc of pendingSnap.docs) {
     const ord = doc.data();
@@ -514,7 +511,7 @@ async function runGmailSync() {
     }
   }
 
-  // Get Gmail Auth Tokens
+  // 2. Get Gmail Auth Tokens
   let tokens = null;
   const authDoc = await db.collection("gateway_config").doc("gmail_auth").get();
   if (authDoc.exists && authDoc.data().tokens) {
@@ -588,25 +585,30 @@ async function runGmailSync() {
     for (const amtPaise of extractedPaiseSet) {
       const orderMatches = await db.collection("orders")
         .where("payablePaise", "==", amtPaise)
-        .where("status", "in", ["PENDING", "EXPIRED"])
+        .where("status", "==", "PENDING")
         .get();
 
-      // Sort newest order first, and PENDING before EXPIRED
-      const sortedDocs = orderMatches.docs.slice().sort((a, b) => {
-        const oa = a.data();
-        const ob = b.data();
-        if (oa.status !== ob.status) return oa.status === "PENDING" ? -1 : 1;
-        return (ob.createdAtMs || 0) - (oa.createdAtMs || 0);
-      });
-
-      for (const orderDoc of sortedDocs) {
+      for (const orderDoc of orderMatches.docs) {
         const targetOrder = orderDoc.data();
         const orderCreatedMs = Number(targetOrder.createdAtMs) || 0;
         const orderExpiresMs = Number(targetOrder.expiresAtMs) || (orderCreatedMs + ORDER_EXPIRY_MS);
 
-        // Email must arrive after order creation (-60s buffer) and within 20 mins of order creation
-        if (emailTimestampMs < orderCreatedMs - 60000) continue;
-        if (emailTimestampMs > orderExpiresMs + 15 * 60 * 1000) continue;
+        // ==========================================
+        // STRICT EXPIRY TIME CHECK IMPLEMENTED HERE
+        // ==========================================
+        const strictBufferMs = 10000; // 10 seconds leeway for minor clock skews
+
+        if (emailTimestampMs < (orderCreatedMs - strictBufferMs)) {
+          // Email is older than order creation time
+          continue;
+        }
+
+        if (emailTimestampMs > orderExpiresMs) {
+          // Payment arrived AFTER order expiration -> EXPIRED & REJECTED!
+          await orderDoc.ref.update({ status: "EXPIRED", expiredAtMs: t });
+          continue;
+        }
+        // ==========================================
 
         const verifiedAt = new Date().toISOString();
         const verifiedAtMs = Date.now();
@@ -620,7 +622,7 @@ async function runGmailSync() {
 
         await db.collection("activity_logs").add({
           type: "success",
-          message: `Order ${targetOrder.orderId} verified for ₹${targetOrder.payableAmount} (UTR: ${utr})`,
+          message: `Strictly verified Order ${targetOrder.orderId} for ₹${targetOrder.payableAmount} (UTR: ${utr})`,
           at: verifiedAt
         });
 
@@ -671,7 +673,6 @@ async function runGmailSync() {
       if (matchedThisEmail) break;
     }
 
-    // Only mark email as seen if it matched an order OR is older than 15 minutes
     if (matchedThisEmail || (t - emailTimestampMs > 15 * 60 * 1000)) {
       seenIds.add(msg.id);
     }
